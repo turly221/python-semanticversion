@@ -3,399 +3,165 @@
 # This code is distributed under the two-clause BSD License.
 
 from __future__ import unicode_literals
-
-import functools
+import datetime
 import re
+import time
+from distutils.version import Version
+
+'''
+This model is used to compare versions and is defined in strict mode with release date property for ease of use
+a version consists of major, minor, patch, pre_release, release_date
+
+major, minor, patch must be int
+release_date must be in format '2017/01/21'
+pre_release should be weighted against keyword list
+
+valid versions:
+1.0
+5.3-alpha
+5.3-alpha.1
+2.1.12
+2.1.12-beta1021
+4.4_build_4.4.000
+11.6.5.1.1-20161213
 
 
-from .compat import base_cmp
+invalid versions:
+5.4h.1
+3alpha
+8231-e2c
+v100r002c00spc108
+
+for pre_release:
+"alpha" < "beta" < "milestone" < "rc" = "cr" < "snapshot" < "" = "final" = "ga" < "sp"
+
+'''
 
 
-def _to_int(value):
-    try:
-        return int(value), True
-    except ValueError:
-        return value, False
+class SemanticVersion(Version):
+    # "alpha" = "a" < "beta" = "b" < "milestone" < "rc" = "cr" < "snapshot" < "" = "final" = "ga" < "sp"
+    pre_release_weight = {"alpha": 1,
+                          "a": 1,
+                          "beta": 2,
+                          "b": 2,
+                          "milestone": 3,
+                          "m": 3,
+                          "rc": 4,
+                          "cr": 4,
+                          "": 6,
+                          "final": 7,
+                          "ga": 8,
+                          "sp": 9}
 
+    def __init__(self, vstring=None, release_date=None, pre_release_weight=None):
+        if pre_release_weight:
+            self.pre_release_weight = pre_release_weight
+        if vstring:
+            self.parse(vstring, release_date)
 
-def _has_leading_zero(value):
-    return (value
-            and value[0] == '0'
-            and value.isdigit()
-            and value != '0')
-
-
-def identifier_cmp(a, b):
-    """Compare two identifier (for pre-release/build components)."""
-
-    a_cmp, a_is_int = _to_int(a)
-    b_cmp, b_is_int = _to_int(b)
-
-    if a_is_int and b_is_int:
-        # Numeric identifiers are compared as integers
-        return base_cmp(a_cmp, b_cmp)
-    elif a_is_int:
-        # Numeric identifiers have lower precedence
-        return -1
-    elif b_is_int:
-        return 1
-    else:
-        # Non-numeric identifiers are compared lexicographically
-        return base_cmp(a_cmp, b_cmp)
-
-
-def identifier_list_cmp(a, b):
-    """Compare two identifier list (pre-release/build components).
-
-    The rule is:
-        - Identifiers are paired between lists
-        - They are compared from left to right
-        - If all first identifiers match, the longest list is greater.
-
-    >>> identifier_list_cmp(['1', '2'], ['1', '2'])
-    0
-    >>> identifier_list_cmp(['1', '2a'], ['1', '2b'])
-    -1
-    >>> identifier_list_cmp(['1'], ['1', '2'])
-    -1
-    """
-    identifier_pairs = zip(a, b)
-    for id_a, id_b in identifier_pairs:
-        cmp_res = identifier_cmp(id_a, id_b)
-        if cmp_res != 0:
-            return cmp_res
-    # alpha1.3 < alpha1.3.1
-    return base_cmp(len(a), len(b))
-
-
-class Version(object):
-
-    version_re = re.compile(r'^(\d+)\.(\d+)\.(\d+)(?:-([0-9a-zA-Z.-]+))?(?:\+([0-9a-zA-Z.-]+))?$')
-    partial_version_re = re.compile(r'^(\d+)(?:\.(\d+)(?:\.(\d+))?)?(?:-([0-9a-zA-Z.-]*))?(?:\+([0-9a-zA-Z.-]*))?$')
-
-    def __init__(self, version_string, partial=False):
-        major, minor, patch, prerelease, build = self.parse(version_string, partial)
-
-        self.major = major
-        self.minor = minor
-        self.patch = patch
-        self.prerelease = prerelease
-        self.build = build
-
-        self.partial = partial
-
-    @classmethod
-    def _coerce(cls, value, allow_none=False):
-        if value is None and allow_none:
-            return value
-        return int(value)
-
-    def next_major(self):
-        if self.prerelease and self.minor == 0 and self.patch == 0:
-            return Version('.'.join(str(x) for x in [self.major, self.minor, self.patch]))
-        else:
-            return Version('.'.join(str(x) for x in [self.major + 1, 0, 0]))
-
-    def next_minor(self):
-        if self.prerelease and self.patch == 0:
-            return Version('.'.join(str(x) for x in [self.major, self.minor, self.patch]))
-        else:
-            return Version(
-                '.'.join(str(x) for x in [self.major, self.minor + 1, 0]))
-
-    def next_patch(self):
-        if self.prerelease:
-            return Version('.'.join(str(x) for x in [self.major, self.minor, self.patch]))
-        else:
-            return Version(
-                '.'.join(str(x) for x in [self.major, self.minor, self.patch + 1]))
-
-    @classmethod
-    def coerce(cls, version_string, partial=False):
-        """Coerce an arbitrary version string into a semver-compatible one.
-
-        The rule is:
-        - If not enough components, fill minor/patch with zeroes; unless
-          partial=True
-        - If more than 3 dot-separated components, extra components are "build"
-          data. If some "build" data already appeared, append it to the
-          extra components
-
-        Examples:
-            >>> Version.coerce('0.1')
-            Version(0, 1, 0)
-            >>> Version.coerce('0.1.2.3')
-            Version(0, 1, 2, (), ('3',))
-            >>> Version.coerce('0.1.2.3+4')
-            Version(0, 1, 2, (), ('3', '4'))
-            >>> Version.coerce('0.1+2-3+4_5')
-            Version(0, 1, 0, (), ('2-3', '4-5'))
-        """
-        base_re = re.compile(r'^\d+(?:\.\d+(?:\.\d+)?)?')
-
-        match = base_re.match(version_string)
-        if not match:
-            raise ValueError(
-                "Version string lacks a numerical component: %r"
-                % version_string
-            )
-
-        version = version_string[:match.end()]
-        if not partial:
-            # We need a not-partial version.
-            while version.count('.') < 2:
-                version += '.0'
-
-        if match.end() == len(version_string):
-            return Version(version, partial=partial)
-
-        rest = version_string[match.end():]
-
-        # Cleanup the 'rest'
-        rest = re.sub(r'[^a-zA-Z0-9+.-]', '-', rest)
-
-        if rest[0] == '+':
-            # A 'build' component
-            prerelease = ''
-            build = rest[1:]
-        elif rest[0] == '.':
-            # An extra version component, probably 'build'
-            prerelease = ''
-            build = rest[1:]
-        elif rest[0] == '-':
-            rest = rest[1:]
-            if '+' in rest:
-                prerelease, build = rest.split('+', 1)
-            else:
-                prerelease, build = rest, ''
-        elif '+' in rest:
-            prerelease, build = rest.split('+', 1)
-        else:
-            prerelease, build = rest, ''
-
-        build = build.replace('+', '.')
-
-        if prerelease:
-            version = '%s-%s' % (version, prerelease)
-        if build:
-            version = '%s+%s' % (version, build)
-
-        return cls(version, partial=partial)
-
-    @classmethod
-    def parse(cls, version_string, partial=False, coerce=False):
-        """Parse a version string into a Version() object.
-
-        Args:
-            version_string (str), the version string to parse
-            partial (bool), whether to accept incomplete input
-            coerce (bool), whether to try to map the passed in string into a
-                valid Version.
-        """
+    def parse(self, version_string, release_date=None):
         if not version_string:
-            raise ValueError('Invalid empty version string: %r' % version_string)
+            raise ValueError(f"{version_string}: version_string is empty.")
 
-        if partial:
-            version_re = cls.partial_version_re
+        v_vectors = version_string.split('.')
+        v_cnt = len(v_vectors)
+        if v_cnt == 1:
+            raise ValueError(f"{version_string}: version_string is invalid.")
+
+        major = v_vectors[0]
+        if not re.match(r'^\d+$', major):
+            raise ValueError(f"{version_string}: major version is invalid.")
+
+        patch = 0
+        pre_release = ""
+
+        raw_minor = v_vectors[1]
+        if re.match(r'^\d+$', raw_minor):
+            minor = raw_minor
+        elif re.match(r'^\d+([-_]).*$', raw_minor):
+            raw_minor = '.'.join(v_vectors[1:])
+            index = re.search(r'[-_]', raw_minor).start()
+            minor = raw_minor[:index]
+            pre_release = raw_minor[index + 1:]
+            # if minor has pre release info, don look for patch
+            v_cnt = 2
         else:
-            version_re = cls.version_re
+            raise ValueError(f"{version_string}: minor version is invalid.")
 
-        match = version_re.match(version_string)
-        if not match:
-            raise ValueError('Invalid version string: %r' % version_string)
-
-        major, minor, patch, prerelease, build = match.groups()
-
-        if _has_leading_zero(major):
-            raise ValueError("Invalid leading zero in major: %r" % version_string)
-        if _has_leading_zero(minor):
-            raise ValueError("Invalid leading zero in minor: %r" % version_string)
-        if _has_leading_zero(patch):
-            raise ValueError("Invalid leading zero in patch: %r" % version_string)
-
-        major = int(major)
-        minor = cls._coerce(minor, partial)
-        patch = cls._coerce(patch, partial)
-
-        if prerelease is None:
-            if partial and (build is None):
-                # No build info, strip here
-                return (major, minor, patch, None, None)
+        if v_cnt > 2:
+            raw_patch = v_vectors[2]
+            if re.match(r'^\d+$', raw_patch):
+                patch = raw_patch
+                pre_release = '.'.join(v_vectors[3:])
             else:
-                prerelease = ()
-        elif prerelease == '':
-            prerelease = ()
-        else:
-            prerelease = tuple(prerelease.split('.'))
-            cls._validate_identifiers(prerelease, allow_leading_zeroes=False)
+                raw_patch = '.'.join(v_vectors[2:])
+                index = re.search(r'[-_]', raw_patch).start()
+                patch = raw_patch[:index]
+                pre_release = raw_patch[index + 1:]
 
-        if build is None:
-            if partial:
-                build = None
-            else:
-                build = ()
-        elif build == '':
-            build = ()
-        else:
-            build = tuple(build.split('.'))
-            cls._validate_identifiers(build, allow_leading_zeroes=True)
+        try:
+            self.major = int(major)
+            self.minor = int(minor)
+            self.patch = int(patch) if not patch else ''
+        except ValueError:
+            raise ValueError(f"{version_string}: major, minor or patch is invalid.")
 
-        return (major, minor, patch, prerelease, build)
+        # convert to weight according to priority
+        pre_release_weight_key = ""
+        for key in list(self.pre_release_weight.keys()):
+            if pre_release.__contains__(key):
+                pre_release_weight_key = key
+                break
+        self.pre_release = pre_release
+        pre_release_num = self.pre_release_weight.get(pre_release_weight_key)
+        self.pre_release_num = pre_release_num
 
-    @classmethod
-    def _validate_identifiers(cls, identifiers, allow_leading_zeroes=False):
-        for item in identifiers:
-            if not item:
-                raise ValueError(
-                    "Invalid empty identifier %r in %r"
-                    % (item, '.'.join(identifiers))
-                )
-
-            if item[0] == '0' and item.isdigit() and item != '0' and not allow_leading_zeroes:
-                raise ValueError("Invalid leading zero in identifier %r" % item)
-
-    def __iter__(self):
-        return iter((self.major, self.minor, self.patch, self.prerelease, self.build))
+        try:
+            release_date = time.mktime(
+                datetime.datetime.strptime(release_date, "%Y/%m/%d").timetuple()) if release_date else None
+        except ValueError:
+            raise ValueError(f"{version_string}: release_date is invalid.")
+        self.release_date = release_date
+        self.version = tuple(map(int, [major, minor, patch, pre_release_num]))
+        self.version_string = version_string
 
     def __str__(self):
-        version = '%d' % self.major
-        if self.minor is not None:
-            version = '%s.%d' % (version, self.minor)
-        if self.patch is not None:
-            version = '%s.%d' % (version, self.patch)
+        release_date = str(self.release_date) if self.release_date else 'N.A.'
+        return self.version_string + ':' + release_date
 
-        if self.prerelease or (self.partial and self.prerelease == () and self.build is None):
-            version = '%s-%s' % (version, '.'.join(self.prerelease))
-        if self.build or (self.partial and self.build == ()):
-            version = '%s+%s' % (version, '.'.join(self.build))
-        return version
+    def _cmp(self, other):
+        if not isinstance(other, SemanticVersion):
+            raise ValueError(f'{other} is not a valid SemanticVersion.')
 
-    def __repr__(self):
-        return '%s(%r%s)' % (
-            self.__class__.__name__,
-            str(self),
-            ', partial=True' if self.partial else '',
-        )
-
-    @classmethod
-    def _comparison_functions(cls, partial=False):
-        """Retrieve comparison methods to apply on version components.
-
-        This is a private API.
-
-        Args:
-            partial (bool): whether to provide 'partial' or 'strict' matching.
-
-        Returns:
-            5-tuple of cmp-like functions.
-        """
-
-        def prerelease_cmp(a, b):
-            """Compare prerelease components.
-
-            Special rule: a version without prerelease component has higher
-            precedence than one with a prerelease component.
-            """
-            if a and b:
-                return identifier_list_cmp(a, b)
-            elif a:
-                # Versions with prerelease field have lower precedence
+        # if release date is present, use release date
+        if self.release_date and other.release_date:
+            if self.release_date == other.release_date:
+                return 0
+            elif self.release_date < other.release_date:
                 return -1
-            elif b:
+            else:
                 return 1
+
+        # compare main version number
+        if self.version != other.version:
+            if self.version < other.version:
+                return -1
             else:
-                return 0
+                return 1
 
-        def build_cmp(a, b):
-            """Compare build metadata.
-
-            Special rule: there is no ordering on build metadata.
-            """
-            if a == b:
-                return 0
+        # compare pre release weight
+        if self.pre_release_num != other.pre_release_num:
+            if self.pre_release_num < other.pre_release_num:
+                return -1
             else:
-                return NotImplemented
-
-        def make_optional(orig_cmp_fun):
-            """Convert a cmp-like function to consider 'None == *'."""
-            @functools.wraps(orig_cmp_fun)
-            def alt_cmp_fun(a, b):
-                if a is None or b is None:
-                    return 0
-                return orig_cmp_fun(a, b)
-
-            return alt_cmp_fun
-
-        if partial:
-            return [
-                base_cmp,  # Major is still mandatory
-                make_optional(base_cmp),
-                make_optional(base_cmp),
-                make_optional(prerelease_cmp),
-                make_optional(build_cmp),
-            ]
+                return 1
         else:
-            return [
-                base_cmp,
-                base_cmp,
-                base_cmp,
-                prerelease_cmp,
-                build_cmp,
-            ]
-
-    def __compare(self, other):
-        comparison_functions = self._comparison_functions(partial=self.partial or other.partial)
-        comparisons = zip(comparison_functions, self, other)
-
-        for cmp_fun, self_field, other_field in comparisons:
-            cmp_res = cmp_fun(self_field, other_field)
-            if cmp_res != 0:
-                return cmp_res
-
-        return 0
-
-    def __hash__(self):
-        return hash((self.major, self.minor, self.patch, self.prerelease, self.build))
-
-    def __cmp__(self, other):
-        if not isinstance(other, self.__class__):
-            return NotImplemented
-        return self.__compare(other)
-
-    def __compare_helper(self, other, condition, notimpl_target):
-        """Helper for comparison.
-
-        Allows the caller to provide:
-        - The condition
-        - The return value if the comparison is meaningless (ie versions with
-            build metadata).
-        """
-        if not isinstance(other, self.__class__):
-            return NotImplemented
-
-        cmp_res = self.__cmp__(other)
-        if cmp_res is NotImplemented:
-            return notimpl_target
-
-        return condition(cmp_res)
-
-    def __eq__(self, other):
-        return self.__compare_helper(other, lambda x: x == 0, notimpl_target=False)
-
-    def __ne__(self, other):
-        return self.__compare_helper(other, lambda x: x != 0, notimpl_target=True)
-
-    def __lt__(self, other):
-        return self.__compare_helper(other, lambda x: x < 0, notimpl_target=False)
-
-    def __le__(self, other):
-        return self.__compare_helper(other, lambda x: x <= 0, notimpl_target=False)
-
-    def __gt__(self, other):
-        return self.__compare_helper(other, lambda x: x > 0, notimpl_target=False)
-
-    def __ge__(self, other):
-        return self.__compare_helper(other, lambda x: x >= 0, notimpl_target=False)
+            if self.pre_release == other.pre_release:
+                return 0
+            elif self.pre_release < other.pre_release:
+                return -1
+            else:
+                return 1
 
 
 class SpecItem(object):
@@ -430,7 +196,8 @@ class SpecItem(object):
     @classmethod
     def parse(cls, requirement_string):
         if not requirement_string:
-            raise ValueError("Invalid empty requirement specification: %r" % requirement_string)
+            raise ValueError(
+                "Invalid empty requirement specification: %r" % requirement_string)
 
         # Special case: the 'any' version spec.
         if requirement_string == '*':
@@ -438,18 +205,14 @@ class SpecItem(object):
 
         match = cls.re_spec.match(requirement_string)
         if not match:
-            raise ValueError("Invalid requirement specification: %r" % requirement_string)
+            raise ValueError(
+                "Invalid requirement specification: %r" % requirement_string)
 
         kind, version = match.groups()
         if kind in cls.KIND_ALIASES:
             kind = cls.KIND_ALIASES[kind]
 
-        spec = Version(version, partial=True)
-        if spec.build is not None and kind not in (cls.KIND_EQUAL, cls.KIND_NEQ):
-            raise ValueError(
-                "Invalid requirement specification %r: build numbers have no ordering."
-                % requirement_string
-            )
+        spec = SemanticVersion(version)
         return (kind, spec)
 
     def match(self, version):
@@ -529,7 +292,7 @@ class Spec(object):
         return None
 
     def __contains__(self, version):
-        if isinstance(version, Version):
+        if isinstance(version, SemanticVersion):
             return self.match(version)
         return False
 
@@ -553,17 +316,42 @@ class Spec(object):
 
 
 def compare(v1, v2):
-    return base_cmp(Version(v1), Version(v2))
+    return base_cmp(SemanticVersion(v1), SemanticVersion(v2))
 
 
 def match(spec, version):
-    return Spec(spec).match(Version(version))
+    return Spec(spec).match(SemanticVersion(version))
 
 
 def validate(version_string):
     """Validates a version string againt the SemVer specification."""
     try:
-        Version.parse(version_string)
+        SemanticVersion.parse(version_string)
         return True
     except ValueError:
         return False
+
+
+def base_cmp(x, y):
+    if x == y:
+        return 0
+    elif x > y:
+        return 1
+    elif x < y:
+        return -1
+    else:
+        # Fix Py2's behavior: cmp(x, y) returns -1 for unorderable types
+        return NotImplemented
+
+
+def check_version_in_criteria(criterias, version):
+    ret = False
+
+    for spec in criterias:
+        ret = ret or spec.match(version)
+        if len(spec.specs) == 2:
+            for spec_item in spec.specs:
+                if spec_item.spec.major == version.major and spec_item.spec.minor == version.minor:
+                    ret = spec.match(version)
+                    break
+    return ret
